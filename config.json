@@ -24,8 +24,9 @@
     "builder.io",
     "strapi.io"
   ],
-  "BYPASS_METHOD": "padding",
+  "BYPASS_METHOD": "wrong_seq",
   "HANDSHAKE_TIMEOUT": 2.0,
   "MAX_CONNECTIONS": 200,
-  "FAKE_DELAY": 0.001
+  "FAKE_DELAY": 0.001,
+  "IDLE_TIMEOUT_S": 300.0
 }

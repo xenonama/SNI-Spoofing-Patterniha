@@ -13,14 +13,28 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 from utils.network_tools import get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
+from utils.auto_state import get_auto_state, reset_auto_state
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector, SUPPORTED_METHODS, REAL_METHODS
 from monitor_connection import reset_stats, get_snapshot, increment_failed, finish_failed, record_result
-from monitor_connection import add_traffic
+from monitor_connection import add_traffic, get_traffic_snapshot
+from monitor_connection import register_active, update_active, unregister_active
 
 log = logging.getLogger("main")
+
+# Relay idle timeout: a direction that sees NO bytes for this long is closed
+# (dead peer, firewall drop, killed process). Prevents leaked sockets,
+# semaphore slots and connection entries. Configurable via IDLE_TIMEOUT_S.
+DEFAULT_RELAY_IDLE_TIMEOUT_S = 300.0
+RELAY_IDLE_TIMEOUT_S = DEFAULT_RELAY_IDLE_TIMEOUT_S
+
+# Success is decided by bytes actually relayed, NOT by the handshake signal
+# (t2a_event was unreliable in the Rust port: deadlocks, missed events ->
+# "OK: 0" with a working tunnel). This mirrors the Rust fix.
+SUCCESS_BYTES_THRESHOLD = 100
 
 
 def get_exe_dir() -> str:
@@ -115,11 +129,211 @@ def run_self_test(config_path: str) -> int:
         assert smart.rank_snis("127.0.0.1", 9, []) == []
         return "helpers OK"
 
+    def _auto_rotation():
+        from utils.auto_state import AutoState
+        from fake_tcp import resolve_method as rm
+        # Deterministic window: tiny thresholds, fake clock.
+        clock = [100.0]
+        st = AutoState(max_failures=3, max_attempts=10, window_s=60.0,
+                       clock=lambda: clock[0])
+        # Sticky: same method repeated within the window.
+        first = st.next_method()
+        assert all(st.next_method() == first for _ in range(5)), "not sticky"
+        # 3 failures trigger rotation.
+        st.note_failure(); st.note_failure(); st.note_failure()
+        second = st.next_method()
+        assert second != first, "3 failures did not rotate"
+        assert st.stats()["attempts"] == 1 and st.stats()["failures"] == 0
+        # 10 attempts trigger rotation.
+        for _ in range(9):
+            st.next_method()
+        third = st.next_method()
+        assert third != second, "10 attempts did not rotate"
+        # 60s elapsed triggers rotation.
+        clock[0] += 61.0
+        fourth = st.next_method()
+        assert fourth != third, "60s elapsed did not rotate"
+        # Singleton integration: resolve_method("auto") is sticky and real.
+        reset_auto_state()
+        m1 = rm("auto")
+        assert m1 in REAL_METHODS
+        assert rm("auto") == m1 and rm("auto") == m1, "auto not sticky via resolve_method"
+        assert rm("split_seq") == "split_seq", "real method must bypass auto"
+        reset_auto_state()
+        return "auto rotation OK (3-fail / 10-try / 60s all rotate, never to same)"
+
+    def _bytes_decision():
+        from monitor_connection import get_traffic_snapshot
+        reset_stats()
+        before = get_traffic_snapshot()
+        # The threshold logic itself (pure math used by handle()):
+        cases = [(0, False), (99, False), (100, True), (1000, True)]
+        for moved, expect_ok in cases:
+            assert (moved >= SUCCESS_BYTES_THRESHOLD) == expect_ok, \
+                "threshold wrong at %d bytes" % moved
+        # record_result feeds auto-state only when auto_resolved=True.
+        reset_auto_state("padding")
+        record_result("9.9.9.9:443", "t.io", True, method="padding", auto_resolved=True)
+        record_result("9.9.9.9:443", "t.io", False, method="padding", auto_resolved=True)
+        assert get_auto_state().stats()["successes"] == 1
+        assert get_auto_state().stats()["failures"] == 1
+        # ...and auto_resolved=False leaves it untouched.
+        record_result("9.9.9.9:443", "t.io", False, method="padding")
+        assert get_auto_state().stats()["failures"] == 1
+        assert before == get_traffic_snapshot()
+        reset_stats()
+        reset_auto_state()
+        return "bytes decision OK (0/99=fail, 100/1000=ok; auto reporting wired)"
+
+    def _active_list():
+        from monitor_connection import (register_active, update_active,
+                                        unregister_active, get_active_list)
+        assert get_active_list() == []
+        a = register_active("a", "1.1.1.1:443", "x.com", "split_seq")
+        b = register_active("b", "2.2.2.2:443", "y.com", "padding")
+        c = register_active("c", "3.3.3.3:443", "z.com", "fragmented")
+        assert len(get_active_list()) == 3
+        update_active(b, up=10, down=20, state="relaying")
+        rows = {r["id"]: r for r in get_active_list()}
+        assert rows["b"]["up"] == 10 and rows["b"]["down"] == 20
+        assert rows["b"]["state"] == "relaying"
+        assert rows["b"]["sni_hash"].startswith("sni#"), "sni_hash missing"
+        unregister_active(a)
+        assert len(get_active_list()) == 2
+        unregister_active(b); unregister_active(c)
+        assert get_active_list() == []
+        return "active list OK (register/update/unregister)"
+
+    def _idle_timeout():
+        import asyncio
+
+        async def _run():
+            # Mock socket pair: recv() blocks until closed -> idle timeout fires.
+            s1, s2 = socket.socketpair()
+            s1.setblocking(False)
+            s2.setblocking(False)
+            closed = {"n": 0}
+
+            class PeerTask:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    closed["n"] += 1
+
+            t0 = time.monotonic()
+            await relay_main_loop(s1, s2, PeerTask(), b"", "up",
+                                  idle_timeout=0.5, conn_id="")
+            took = time.monotonic() - t0
+            assert 0.3 < took < 2.0, "idle timeout did not fire in ~0.5s (took %.2fs)" % took
+            assert closed["n"] == 1, "peer task not cancelled after timeout"
+            try:
+                s1.close()
+                s2.close()
+            except Exception:
+                pass
+
+        asyncio.run(_run())
+        # Config plumbing: default valid, bounds enforced.
+        from utils import config_manager as _cm
+        assert _cm.validate(_cm.migrate({"IDLE_TIMEOUT_S": 300.0})) == []
+        assert _cm.validate(_cm.migrate({"IDLE_TIMEOUT_S": 0.0})) != []
+        assert _cm.validate(_cm.migrate({"IDLE_TIMEOUT_S": 3601.0})) != []
+        return "idle timeout OK (fires at ~timeout, cancels peer, config-validated)"
+
+    def _relay_zero_copy():
+        import asyncio
+        from monitor_connection import get_traffic_snapshot, get_active_list
+        reset_stats()
+        reset_auto_state()
+
+        async def _run():
+            # Real TCP socketpair THROUGH relay_main_loop: validates the
+            # zero-copy recv_into path, first-chunk prefix splicing, traffic
+            # accounting and EOF handling end to end.
+            from monitor_connection import register_active, unregister_active
+            loop = asyncio.get_running_loop()
+            a, b = socket.socketpair()
+            c, d = socket.socketpair()
+            # ALL four sockets are driven through the event loop: blocking
+            # sendall/recv here would stall the loop and starve the relay task.
+            for s in (a, b, c, d):
+                s.setblocking(False)
+                tune_relay_socket(s)
+            payload = bytes(range(256)) * 400  # 102_400 B: > 1 full 64 KiB chunk
+            register_active("rz", "1.2.3.4:1", "t.io", "padding")
+            closed = {"n": 0}
+
+            class PeerTask:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    closed["n"] += 1
+
+            prefix = b"PFX"
+            up_task = asyncio.create_task(
+                relay_main_loop(a, c, PeerTask(), prefix, "up",
+                                idle_timeout=2.0, conn_id="rz"))
+            await asyncio.sleep(0.05)
+            await loop.sock_sendall(b, payload)
+            b.shutdown(socket.SHUT_WR)  # EOF after payload -> relay drains
+            got = bytearray()
+            need = len(prefix) + len(payload)
+            while len(got) < need:
+                chunk = await asyncio.wait_for(loop.sock_recv(d, 65536), timeout=3.0)
+                if not chunk:
+                    break
+                got.extend(chunk)
+            assert bytes(got[:len(prefix)]) == prefix, "prefix not spliced"
+            assert bytes(got[len(prefix):]) == payload, "payload corrupted in zero-copy relay"
+            await asyncio.wait_for(up_task, timeout=3.0)
+            total = len(prefix) + len(payload)  # prefix counts as relayed bytes
+            up_b, down_b = get_traffic_snapshot()
+            assert up_b == total and down_b == 0, \
+                "traffic accounting wrong: up=%d down=%d" % (up_b, down_b)
+            rows = {r["id"]: r for r in get_active_list()}
+            rz = rows.get("rz")
+            assert rz is not None, "active entry lost after relay"
+            assert rz["up"] == total, \
+                "batched active-list byte flush wrong: %r" % rz["up"]
+            assert rz["state"] == "closing", "final state not flushed"
+            unregister_active("rz")
+            for s in (a, b, c, d):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+        asyncio.run(_run())
+        reset_stats()
+        reset_auto_state()
+        return "relay zero-copy OK (prefix + %d KiB byte-exact, EOF, accounting)" % 100
+
+    def _rank_endpoints():
+        from utils.smart import rank_endpoints
+        # Empty list must not raise.
+        assert rank_endpoints([]) == []
+        assert rank_endpoints([{}, {"ip": "", "port": 1}]) == []
+        # Invalid IPs / ports must not raise; unreachable -> ok=False.
+        res = rank_endpoints([{"ip": "999.999.999.999", "port": 443},
+                              {"ip": "127.0.0.1", "port": 1}],
+                             timeout=0.3, tries=1)
+        assert isinstance(res, list) and len(res) >= 1
+        assert all(isinstance(r, dict) and "ok" in r for r in res)
+        return "rank_endpoints OK (empty + invalid inputs safe)"
+
     check("config", _cfg)
     check("packet_template", _template)
     check("scoreboard", _score)
     check("split_plan", _split)
     check("helpers", _smart)
+    check("auto_rotation", _auto_rotation)
+    check("bytes_decision", _bytes_decision)
+    check("active_list", _active_list)
+    check("idle_timeout", _idle_timeout)
+    check("relay_zero_copy", _relay_zero_copy)
+    check("rank_endpoints", _rank_endpoints)
     results["ok"] = ok_all
     print(json.dumps(results, indent=2), flush=True)
     return 0 if ok_all else 1
@@ -167,6 +381,7 @@ def load_config(path: str) -> dict:
         "HANDSHAKE_TIMEOUT": float(cfg.get("HANDSHAKE_TIMEOUT", 2.0)),
         "MAX_CONNECTIONS": int(cfg.get("MAX_CONNECTIONS", 200)),
         "FAKE_DELAY": float(cfg.get("FAKE_DELAY", 0.001)),
+        "IDLE_TIMEOUT_S": float(cfg.get("IDLE_TIMEOUT_S", DEFAULT_RELAY_IDLE_TIMEOUT_S)),
         "DATA_MODE": "tls",
     }
     return out
@@ -200,12 +415,23 @@ except Exception:
     pass
 config_path = os.path.abspath(args.config) if args.config else os.path.join(get_exe_dir(), "config.json")
 if args.self_test:
-    sys.exit(run_self_test(config_path))
-try:
-    config = load_config(config_path)
-except Exception as exc:
-    print(f"FATAL: cannot load config {config_path}: {exc}", flush=True)
-    sys.exit(2)
+    # --self-test never touches the real config: it must pass on a clean
+    # checkout / missing config.json. Real startup keeps strict load-or-exit.
+    config = {"ENDPOINTS": [{"ip": "127.0.0.1", "port": 443}],
+              "FAKE_SNIS": ["example.com"],
+              "LISTEN_HOST": "127.0.0.1",
+              "LISTEN_PORT": 0,
+              "BYPASS_METHOD": "auto",
+              "HANDSHAKE_TIMEOUT": 2.0,
+              "MAX_CONNECTIONS": 200,
+              "FAKE_DELAY": 0.001,
+              "IDLE_TIMEOUT_S": DEFAULT_RELAY_IDLE_TIMEOUT_S}
+else:
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        print(f"FATAL: cannot load config {config_path}: {exc}", flush=True)
+        sys.exit(2)
 
 LISTEN_HOST = config["LISTEN_HOST"]
 LISTEN_PORT = config["LISTEN_PORT"]
@@ -215,6 +441,8 @@ BYPASS_METHOD = config["BYPASS_METHOD"]
 HANDSHAKE_TIMEOUT = config["HANDSHAKE_TIMEOUT"]
 MAX_CONNECTIONS = config["MAX_CONNECTIONS"]
 FAKE_DELAY = config["FAKE_DELAY"]
+IDLE_TIMEOUT_S = config["IDLE_TIMEOUT_S"]
+RELAY_IDLE_TIMEOUT_S = IDLE_TIMEOUT_S
 DATA_MODE = "tls"
 
 # Round-robin endpoint picker with failover in handle().
@@ -239,18 +467,26 @@ def ep_key(ep: dict) -> str:
     return f"{ep['ip']}:{ep['port']}"
 
 
-def note_fail(conn, endpoint: str, sni: str):
+def note_fail(conn, endpoint: str, sni: str, reason: str = ""):
     """Record a failed attempt without double-counting injector stats.
 
     If the injector already counted this connection (finish_failed via
     on_unexpected_packet), only the scoreboard needs updating. Otherwise
-    the engine owns the failure counter.
+    the engine owns the failure counter. `reason` is only for DEBUG logs.
     """
     try:
         method = getattr(conn, "bypass_method", "") or ""
     except Exception:
         method = ""
-    record_result(endpoint, sni, False, method=method)
+    if reason:
+        try:
+            log.debug("note_fail %s %s: %s", endpoint, method, reason)
+        except Exception:
+            pass
+    # Feed the sticky auto rotation: this connection's method came from the
+    # auto window whenever the configured method was "auto".
+    auto_resolved = (BYPASS_METHOD == "auto")
+    record_result(endpoint, sni, False, method=method, auto_resolved=auto_resolved)
     try:
         if conn is not None and getattr(conn, "counted", False):
             conn.monitor = False
@@ -351,24 +587,106 @@ def set_keepalive(sock: socket.socket):
             pass
 
 
+RELAY_RECV_BUF_SIZE = 65575  # 64 KiB + slack recv window (same as old literal)
+RELAY_SOCK_BUFSIZE = 262144  # 256 KiB kernel send/recv buffers for burst throughput
+# Active-list lock is touched every N relay chunks (GUI live-byte granularity
+# vs lock contention trade-off). 16 chunks ~= 1 MiB at full 64 KiB chunks.
+RELAY_ACTIVE_FLUSH_CHUNKS = 16
+
+
+def tune_relay_socket(sock: socket.socket):
+    """Low-latency + throughput tuning for relay sockets. Best effort."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, RELAY_SOCK_BUFSIZE)
+        except OSError:
+            pass
+
+
 async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_task: asyncio.Task,
-                           first_prefix_data: bytes, direction: str = ""):
-    """Forward sock_1 -> sock_2. direction 'up' (clients->net) / 'down' feeds the traffic tracker."""
+                           first_prefix_data: bytes, direction: str = "",
+                           idle_timeout: float | None = None,
+                           conn_id: str = ""):
+    """Forward sock_1 -> sock_2. direction 'up' (clients->net) / 'down' feeds the traffic tracker.
+
+    Performance notes (hot path — runs per 64 KiB chunk, both directions of
+    every connection):
+    - Zero-copy receive via loop.sock_recv_into() into ONE reusable buffer,
+      then send a memoryview slice. No per-chunk bytes objects are allocated
+      (the old loop allocated per chunk: recv() bytes + prefix concat).
+    - Active-list updates are batched: the stats lock is touched every
+      RELAY_ACTIVE_FLUSH_CHUNKS chunks (and once on exit) instead of per chunk.
+      Traffic totals (add_traffic) still update per chunk.
+
+    Each direction has its own idle timeout: if THIS side sees no bytes for
+    `idle_timeout` seconds the loop breaks and cleanup runs (the peer task is
+    cancelled as before). A silently dead peer can no longer pin the socket,
+    the semaphore slot and the connection entry forever.
+    """
     loop = asyncio.get_running_loop()
+    if idle_timeout is None:
+        idle_timeout = RELAY_IDLE_TIMEOUT_S
+    # Zero-copy receive: Proactor (Windows) and epoll (Linux) loops both expose
+    # sock_recv_into. Fall back silently to sock_recv if unavailable.
+    _recv_into = getattr(loop, "sock_recv_into", None)
+    buf = bytearray(RELAY_RECV_BUF_SIZE)
+    _prefix = bytes(first_prefix_data)
+    chunk_count = 0
+    pending_up = 0
+    pending_down = 0
     try:
         while True:
             try:
-                data = await loop.sock_recv(sock_1, 65575)
-                if not data:
+                try:
+                    if _recv_into is not None:
+                        # NOTE: loop.sock_recv_into is a BOUND method —
+                        # call it as (sock, buffer), not (loop, sock, buffer).
+                        nread = await asyncio.wait_for(
+                            _recv_into(sock_1, buf), timeout=idle_timeout)
+                    else:
+                        data = await asyncio.wait_for(loop.sock_recv(sock_1, RELAY_RECV_BUF_SIZE),
+                                                      timeout=idle_timeout)
+                        nread = len(data)
+                except asyncio.TimeoutError:
+                    try:
+                        log.debug("relay idle timeout after %gs, closing connection %s (%s)",
+                                  idle_timeout, conn_id or "?", direction or "?")
+                    except Exception:
+                        pass
+                    break
+                if not nread:
                     raise ConnectionError("eof")
-                if first_prefix_data:
-                    data = first_prefix_data + data
-                    first_prefix_data = b""
+                chunk_count += 1
+                # Zero-copy send: view into the reusable buffer. The prefix
+                # (pre-relay leftover bytes) is spliced in ONLY on the first
+                # chunk, then the fast path resumes.
+                if _prefix:
+                    data = _prefix + bytes(memoryview(buf)[:nread])
+                    _prefix = b""
+                    n = len(data)
+                    await loop.sock_sendall(sock_2, data)
+                else:
+                    n = nread
+                    await loop.sock_sendall(sock_2, memoryview(buf)[:nread])
                 if direction == "up":
-                    add_traffic(up=len(data))
+                    add_traffic(up=n)
                 elif direction == "down":
-                    add_traffic(down=len(data))
-                await loop.sock_sendall(sock_2, data)
+                    add_traffic(down=n)
+                if conn_id:
+                    # Batch the lock: accumulate deltas, flush every N chunks.
+                    if direction == "up":
+                        pending_up += n
+                    else:
+                        pending_down += n
+                    if chunk_count % RELAY_ACTIVE_FLUSH_CHUNKS == 0:
+                        update_active(conn_id, up=pending_up, down=pending_down,
+                                      state="relaying")
+                        pending_up = 0
+                        pending_down = 0
             except (ConnectionError, OSError):
                 break
             except asyncio.CancelledError:
@@ -377,6 +695,9 @@ async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_tas
                 log.debug("relay error", exc_info=True)
                 break
     finally:
+        if conn_id:
+            update_active(conn_id, up=pending_up, down=pending_down,
+                          state="closing")
         for s in (sock_1, sock_2):
             try:
                 s.close()
@@ -415,6 +736,10 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
     conn: FakeInjectiveConnection | None = None
     sni_str = ""
     cur_ep_key = ""
+    active_id = ""          # uuid key into the GUI active-connections list
+    bytes_before = (0, 0)   # traffic totals captured right before the relay
+    relay_started = False
+    handshake_ok = False
     try:
         sni_str = pick_sni()
         fake_sni = sni_str.encode()
@@ -427,6 +752,7 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
 
         outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         outgoing_sock.setblocking(False)
+        tune_relay_socket(outgoing_sock)
         try:
             outgoing_sock.bind((INTERFACE_IPV4, 0))
         except OSError as exc:
@@ -448,12 +774,16 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         conn = FakeInjectiveConnection(outgoing_sock, INTERFACE_IPV4, first["ip"], src_port, first["port"],
                                        fake_data, BYPASS_METHOD, incoming_sock)
         fake_injective_connections[conn.id] = conn
+        # Show the resolved wire method (not "auto") + hashed SNI in the GUI.
+        active_id = register_active(uuid.uuid4().hex, ep_key(first), sni_str,
+                                    getattr(conn, "bypass_method", "") or BYPASS_METHOD,
+                                    state="connecting")
 
         connected_ep = await try_connect(loop, outgoing_sock, ordered)
         if connected_ep is None:
             conn.monitor = False
             fake_injective_connections.pop(conn.id, None)
-            note_fail(None, ep_key(first), sni_str)
+            note_fail(None, ep_key(first), sni_str, reason="all endpoints refused/timeout")
             outgoing_sock.close()
             incoming_sock.close()
             return
@@ -465,18 +795,20 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
             conn.dst_port = connected_ep["port"]
             conn.id = (conn.src_ip, conn.src_port, conn.dst_ip, conn.dst_port)
             fake_injective_connections[conn.id] = conn
+            update_active(active_id, endpoint=cur_ep_key)
+        update_active(active_id, state="handshake")
 
         if BYPASS_METHOD in SUPPORTED_METHODS:
             try:
                 await asyncio.wait_for(conn.t2a_event.wait(), HANDSHAKE_TIMEOUT)
                 if conn.t2a_msg != "fake_data_ack_recv":
                     raise ConnectionError(f"bypass failed: {conn.t2a_msg or 'timeout'}")
-            except Exception:
+            except Exception as exc:
                 conn.monitor = False
                 fake_injective_connections.pop(conn.id, None)
                 # Injector already recorded stats via finish_failed() when it
                 # saw the unexpected packet; note_fail() avoids double count.
-                note_fail(conn, cur_ep_key or ep_key(first), sni_str)
+                note_fail(conn, cur_ep_key or ep_key(first), sni_str, reason=str(exc))
                 try:
                     outgoing_sock.close()
                 except Exception:
@@ -487,13 +819,14 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
                     pass
                 return
             else:
-                record_result(cur_ep_key or ep_key(first), sni_str, True,
-                              method=getattr(conn, "bypass_method", "") or "")
+                # Advisory only: t2a no longer decides success/fail — bytes do.
+                handshake_ok = True
         else:
             log.error("unknown bypass method: %s", BYPASS_METHOD)
             conn.monitor = False
             fake_injective_connections.pop(conn.id, None)
-            note_fail(conn, cur_ep_key or ep_key(first), sni_str)
+            note_fail(conn, cur_ep_key or ep_key(first), sni_str,
+                      reason="unsupported bypass method")
             outgoing_sock.close()
             incoming_sock.close()
             return
@@ -501,8 +834,18 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         conn.monitor = False
         fake_injective_connections.pop(conn.id, None)
 
-        oti_task = asyncio.create_task(relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b"", "down"))
-        await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"", "up")
+        # ---- success = bytes moved during the relay (Rust-reference fix).
+        # Capture the traffic totals RIGHT BEFORE the relay starts; the
+        # per-connection delta (not global counters) decides the outcome.
+        bytes_before = get_traffic_snapshot()
+        relay_started = True
+        update_active(active_id, state="relaying")
+
+        oti_task = asyncio.create_task(
+            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b"", "down",
+                            idle_timeout=RELAY_IDLE_TIMEOUT_S, conn_id=active_id))
+        await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"", "up",
+                              idle_timeout=RELAY_IDLE_TIMEOUT_S, conn_id=active_id)
     except Exception:
         log.error("handle error", exc_info=True)
         try:
@@ -523,6 +866,60 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
             except Exception:
                 pass
     finally:
+        # ---- bytes-moved decision (runs on EVERY path: normal EOF, error,
+        # cancellation, idle timeout) ----
+        try:
+            if relay_started:
+                up_b, down_b = get_traffic_snapshot()
+                moved = (up_b - bytes_before[0]) + (down_b - bytes_before[1])
+                ok = moved >= SUCCESS_BYTES_THRESHOLD
+                method_used = getattr(conn, "bypass_method", "") or "" if conn else ""
+                if ok:
+                    record_result(cur_ep_key, sni_str, True, method=method_used,
+                                  auto_resolved=(BYPASS_METHOD == "auto"))
+                elif not handshake_ok:
+                    # Pre-relay handshake failures already reported via
+                    # note_fail(); do not double count them here.
+                    pass
+                else:
+                    record_result(cur_ep_key, sni_str, False, method=method_used,
+                                  auto_resolved=(BYPASS_METHOD == "auto"))
+                log.debug("conn %s: moved=%d ok=%s", active_id or "?", moved,
+                          "yes" if ok else "no")
+            elif handshake_ok and conn is not None:
+                # Handshake passed but the relay never began (rare exception
+                # window): bytes are 0 -> count as fail for the scoreboard.
+                try:
+                    record_result(cur_ep_key, sni_str, False,
+                                  method=getattr(conn, "bypass_method", "") or "",
+                                  auto_resolved=(BYPASS_METHOD == "auto"))
+                except Exception:
+                    pass
+            elif not handshake_ok and conn is not None and conn.monitor:
+                # Exception between register and the handshake wait: count it.
+                note_fail(conn, cur_ep_key or "", sni_str, reason="error before handshake wait")
+        except Exception:
+            pass
+        if active_id:
+            unregister_active(active_id)
+        # Safety net: every path (return, exception, cancellation) evicts
+        # the dict entry and releases sockets. Manual pops above are
+        # idempotent, so double-pop here is harmless but closes the leak
+        # when an exception happens before/after `conn` is assigned.
+        _drop_conn(conn)
+        _close_sock_quiet(outgoing_sock)
+        # incoming_sock is owned by handle() until relay finishes; by the
+        # time finally runs the relay is done (or never started), so this
+        # is safe and covers early-error paths that forgot to close it.
+        # Note: relay_main_loop already closes both sockets on success.
+        try:
+            incoming_sock.close()
+        except Exception:
+            pass
+        try:
+            conn_sem.release()
+        except ValueError:
+            pass
         # Safety net: every path (return, exception, cancellation) evicts
         # the dict entry and releases sockets. Manual pops above are
         # idempotent, so double-pop here is harmless but closes the leak
@@ -599,6 +996,7 @@ async def main():
             await asyncio.sleep(0.05)
             continue
         incoming_sock.setblocking(False)
+        tune_relay_socket(incoming_sock)
         set_keepalive(incoming_sock)
         asyncio.create_task(handle(incoming_sock, addr))
 
@@ -618,6 +1016,11 @@ if __name__ == "__main__":
         signal.signal(signal.SIGTERM, signal_handler)
     except Exception:
         pass
+
+    # Self-test runs AFTER all module defs (it exercises relay_main_loop)
+    # and BEFORE anything privileged (no Admin/WinDivert/mutex needed).
+    if args.self_test:
+        sys.exit(run_self_test(config_path))
 
     reset_stats()
 

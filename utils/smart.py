@@ -52,14 +52,26 @@ def tcp_ping(ip: str, port: int, timeout: float = 3.0, tries: int = 2) -> float 
 
 
 def rank_endpoints(endpoints: list[dict], timeout: float = 3.0,
-                   max_workers: int = 8) -> list[dict]:
-    """Return [{ip, port, latency_ms|None, ok}] sorted reachable-first by latency."""
-    eps = [{"ip": str(e.get("ip", "")).strip(), "port": int(e.get("port", 443))}
-           for e in (endpoints or []) if str(e.get("ip", "")).strip()]
+                   tries: int = 2, max_workers: int = 8) -> list[dict]:
+    """Return [{ip, port, latency_ms|None, ok}] sorted reachable-first by latency.
+
+    Invalid IPs / empty lists are handled gracefully: they simply never
+    become results (or fail individually), so callers can rank anything.
+    """
+    eps: list[dict] = []
+    for e in (endpoints or []):
+        try:
+            ip = str((e or {}).get("ip", "")).strip()
+            if not ip:
+                continue
+            eps.append({"ip": ip, "port": int((e or {}).get("port", 443))})
+        except (TypeError, ValueError, AttributeError):
+            continue
     results: list[dict] = []
 
     def probe(ep: dict) -> dict:
-        lat = tcp_ping(ep["ip"], ep["port"], timeout=timeout, tries=2)
+        lat = tcp_ping(ep["ip"], ep["port"], timeout=timeout,
+                       tries=max(1, int(tries)))
         return {"ip": ep["ip"], "port": ep["port"],
                 "latency_ms": round(lat, 1) if lat is not None else None,
                 "ok": lat is not None}

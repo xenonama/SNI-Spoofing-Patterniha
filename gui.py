@@ -35,6 +35,17 @@ PROFILES_DIR = os.path.join(APP_DIR, "profiles")
 LOGS_DIR = os.path.join(APP_DIR, "logs")
 IP_LIST_PATH = os.path.join(APP_DIR, "ip_list.txt")
 SNI_LIST_PATH = os.path.join(APP_DIR, "sni_list.txt")
+# Window/taskbar icon: inside a frozen exe, PyInstaller --add-data unpacks
+# app.ico into the temp bundle dir (_MEIPASS); otherwise use the copy next
+# to the script/exe.
+ICON_PATH = os.path.join(APP_DIR, "app.ico")
+if getattr(sys, "frozen", False):
+    try:
+        _bundled_icon = os.path.join(getattr(sys, "_MEIPASS", ""), "app.ico")
+        if os.path.isfile(_bundled_icon):
+            ICON_PATH = _bundled_icon
+    except Exception:
+        pass
 # Keep the WinDivert filter + failover list small. File lists can hold
 # dozens of candidates; only the fastest few are written into config.
 MAX_FILE_ENDPOINTS = 8
@@ -126,6 +137,36 @@ FONT_STATUS = ("Segoe UI", 10, "bold")
 # --------------------------------------------------------------------------
 # Small helpers (unchanged behavior)
 # --------------------------------------------------------------------------
+def set_app_icon(window) -> None:
+    """Apply app.ico to a Tk window (title bar, Alt-Tab, taskbar button).
+
+    Also used as the DEFAULT for every Toplevel created later. Best-effort:
+    a missing/invalid icon must never block startup. Never raises.
+    """
+    try:
+        if os.path.isfile(ICON_PATH):
+            window.iconbitmap(ICON_PATH)          # this window's title bar
+            window.iconbitmap(default=ICON_PATH)  # default for child toplevels
+    except Exception:
+        pass
+
+
+def set_windows_appusermodelid() -> None:
+    """Give the process a stable AppUserModelID (Windows taskbar).
+
+    Keeps the taskbar button separate from other python(w).exe windows so the
+    embedded app icon is used for pinning/grouping. Only needed when running
+    from source (a frozen exe is already identified by its own icon). Must be
+    called BEFORE the first window is created. Never raises.
+    """
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SNI.Spoofer.GUI")
+    except Exception:
+        pass
+
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -1191,6 +1232,8 @@ class SpooferGUI:
         self.success_rate = 0.0
         self.best_endpoint = ""
         self.best_method = ""
+        self.auto_method = ""   # current sticky auto-mode method (from backend)
+        self.auto_stats = {}
         self.method_rate = 0.0
         self.method_runs = 0
         self.up_bytes = 0
@@ -1205,6 +1248,9 @@ class SpooferGUI:
         self._mode_rows = {}
         self.log_file = None
         self.busy_jobs = 0
+        # Autosave (debounced): pending after() id + suppression flags.
+        self._autosave_after_id = None
+        self._loading_config = False
         self._spin_i = 0
         self._pulse_on = False
         self._page = ""
@@ -1231,6 +1277,7 @@ class SpooferGUI:
         self.v_method = tk.StringVar(value=str(cfg.get("BYPASS_METHOD", "auto")))
         self.v_timeout = tk.StringVar(value=str(cfg.get("HANDSHAKE_TIMEOUT", 2.0)))
         self.v_maxconn = tk.StringVar(value=str(cfg.get("MAX_CONNECTIONS", 200)))
+        self.v_idle = tk.StringVar(value=str(cfg.get("IDLE_TIMEOUT_S", 300.0)))
         # Verbose toggle removed: console always behaves as Verbose=OFF.
         try:
             self.v_method.trace_add("write", lambda *a: self._refresh_method_ui())
@@ -1291,6 +1338,9 @@ class SpooferGUI:
         self.root.after(800, lambda: self._slide_indicator(self._page))
 
         self._open_log_file()
+        # Wire config-var traces LAST so startup var mutations never trigger
+        # a save of a half-built UI.
+        self._attach_autosave_vars()
         self._show_window()
         # Defer environment checks until after first paint so cold open
         # never blocks on admin/driver/filesystem probes.
@@ -1439,9 +1489,10 @@ class SpooferGUI:
         # buttons, so winfo_y() lines up). Placed after layout settles.
         self.nav_ind = tk.Frame(side, bg=THEME["accent"], width=4, height=42)
         self.nav_ind.place(x=0, y=40)
-        for key, label in (("bypass", "🛡️   DPI Bypass"),
-                           ("proxy", "🌐   Proxy / Xray"),
-                           ("tools", "🛠   Smart Tools")):
+        for key, label in (("bypass", "✦   DPI Bypass"),
+                           ("proxy", "◈   Proxy / Xray"),
+                           ("active", "⌖   Active Conns"),
+                           ("tools", "⚒   Smart Tools")):
             b = ModernButton(side, text=label, command=lambda k=key: self._show_page(k),
                              style="ghost", height=42, align="left", focusable=False)
             b.configure(bg=THEME["sidebar"])
@@ -1461,7 +1512,7 @@ class SpooferGUI:
         self.btn_stop.config(state=tk.DISABLED)
         for txt, cmd in (("⧉  Copy proxy", self.copy_proxy),
                          ("⬆  Run as admin", lambda: relaunch_as_admin(os.path.abspath(__file__))),
-                         ("💾  Save config", self.save_only)):
+                         ("❖  Save config", self.save_only)):
             b = ModernButton(side, text=txt, command=cmd, style="ghost", height=32, focusable=False)
             b.configure(bg=THEME["sidebar"])
             b.pack(fill=tk.X, padx=10, pady=2)
@@ -1643,6 +1694,9 @@ class SpooferGUI:
         tk.Label(trow, text="Max conn", bg=THEME["card"], fg=THEME["muted"],
                  font=FONT_N).pack(side=tk.LEFT, padx=(10, 2))
         self._entry(trow, self.v_maxconn, width=7).pack(side=tk.LEFT, padx=2)
+        tk.Label(trow, text="Idle timeout (s)", bg=THEME["card"], fg=THEME["muted"],
+                 font=FONT_N).pack(side=tk.LEFT, padx=(10, 2))
+        self._entry(trow, self.v_idle, width=7).pack(side=tk.LEFT, padx=2)
         self._card(p1, "Failover  ·  extra endpoints + SNIs").pack(fill=tk.X, pady=(0, 14))
         card = self._cards[-1]
         self._row(card, "Extra endpoints", None, w=40, text_var_name="extra",
@@ -1684,8 +1738,11 @@ class SpooferGUI:
         self._row(card, "WS path", self.v_path)
         self._row(card, "WS host", self.v_host)
 
-        p3 = self._page_frame("tools")
-        self._card(p3, "Smart tools   ·   no Admin needed except START").pack(fill=tk.BOTH, expand=True)
+        p3 = self._page_frame("active")
+        self._build_active_page(p3)
+
+        p4 = self._page_frame("tools")
+        self._card(p4, "Smart tools   ·   no Admin needed except START").pack(fill=tk.BOTH, expand=True)
         card = self._cards[-1]
         thead = tk.Frame(card, bg=THEME["card"])
         thead.pack(fill=tk.X, padx=14, pady=(8, 2))
@@ -1694,9 +1751,11 @@ class SpooferGUI:
         self.lbl_busy = tk.Label(thead, text="", bg=THEME["card"], fg=THEME["accent"], font=FONT_N)
         self.lbl_busy.pack(side=tk.RIGHT)
         for txt, cmd in [
-            ("📶  Ping SNIs on primary endpoint", self.smart_rank_snis),
-            ("🏆  Ping SNIs + use best SNI to spoof", self.smart_use_best_sni),
-            ("🔄  Reload ip_list.txt / sni_list.txt", self.smart_reload_lists),
+            ("▁▃▅▇  Ping SNIs on primary endpoint", self.smart_rank_snis),
+            ("✪  Ping SNIs + use best SNI to spoof", self.smart_use_best_sni),
+            ("◈  Ping endpoints (TCP connect)", self.smart_rank_endpoints),
+            ("★  Use best endpoint", self.smart_use_best_endpoint),
+            ("⟳  Reload ip_list.txt / sni_list.txt", self.smart_reload_lists),
         ]:
             ModernButton(card, text=txt, command=cmd, style="ghost",
                          height=33, align="left").pack(fill=tk.X, padx=14, pady=2)
@@ -1736,12 +1795,12 @@ class SpooferGUI:
         tk.Label(r, text=label, width=20, anchor="w", bg=THEME["card"],
                  fg=THEME["muted"], font=FONT_N).pack(side=tk.LEFT)
         if text_var_name == "extra":
-            self.e_extra = self._entry(r, None, width=w)
-            self.e_extra.insert(0, self.extra_eps_text)
+            self.v_extra = tk.StringVar(value=self.extra_eps_text)
+            self.e_extra = self._entry(r, self.v_extra, width=w)
             self.e_extra.pack(side=tk.LEFT, padx=8, ipady=4, fill=tk.X, expand=True)
         elif text_var_name == "snis":
-            self.e_snis = self._entry(r, None, width=w)
-            self.e_snis.insert(0, self.snis_text)
+            self.v_snis = tk.StringVar(value=self.snis_text)
+            self.e_snis = self._entry(r, self.v_snis, width=w)
             self.e_snis.pack(side=tk.LEFT, padx=8, ipady=4, fill=tk.X, expand=True)
         elif var is not None:
             self._entry(r, var, width=w).pack(side=tk.LEFT, padx=8, ipady=4)
@@ -1887,6 +1946,236 @@ class SpooferGUI:
         except Exception:
             pass
 
+    # -- active connections page -----------------------------------
+    # Row tint per connection state (subtle, dark-theme friendly).
+    ACTIVE_STATE_TAGS = {
+        "relaying": ("st_relaying", "●"),
+        "handshake": ("st_handshake", "◐"),
+        "connecting": ("st_connecting", "○"),
+        "closing": ("st_closing", "◑"),
+    }
+
+    def _build_active_page(self, p3):
+        """Live connection table: updates every stats poll (2s)."""
+        self._card(p3, "Active connections   ·   live view (updates every 2s)").pack(fill=tk.BOTH, expand=True)
+        card = self._cards[-1]
+
+        # Header row: live count chip + hint + clear/show toggle.
+        head = tk.Frame(card, bg=THEME["card"])
+        head.pack(fill=tk.X, padx=14, pady=(8, 4))
+        self.lbl_active_chip = tk.Label(head, text="● 0 active", font=FONT_STATUS,
+                                        fg=THEME["faint"], bg=THEME["card"])
+        self.lbl_active_chip.pack(side=tk.LEFT)
+        tk.Label(head, text="Click a row to reveal that session's SNI (debug). "
+                            "Table shows hashed SNIs for privacy.",
+                 bg=THEME["card"], fg=THEME["faint"], font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(12, 0))
+        self.btn_clear_active = ModernButton(head, text="Clear display",
+                                             command=self._toggle_active_display,
+                                             style="ghost", height=26)
+        self.btn_clear_active.pack(side=tk.RIGHT)
+
+        cols = ("time", "endpoint", "sni", "method", "up", "down", "state")
+        self._active_headings = {"time": "Time", "endpoint": "Endpoint", "sni": "SNI",
+                                 "method": "Method", "up": "Up", "down": "Down", "state": "State"}
+        widths = {"time": 76, "endpoint": 160, "sni": 120, "method": 120,
+                  "up": 90, "down": 90, "state": 110}
+        anchors = {"time": "center", "up": "e", "down": "e", "state": "w"}
+
+        # Dark Fluent styling for the tree + its headings (clam base).
+        style = self._style
+        style.configure("Active.Treeview",
+                        background=THEME["console_bg"],
+                        fieldbackground=THEME["console_bg"],
+                        foreground=THEME["fg"],
+                        rowheight=27, borderwidth=0, relief="flat", font=FONT_N)
+        style.configure("Active.Treeview.Heading",
+                        background=THEME["card"], foreground=THEME["accent"],
+                        font=("Segoe UI Semibold", 8), borderwidth=0,
+                        relief="flat", padding=(8, 7))
+        style.map("Active.Treeview.Heading",
+                  background=[("active", THEME["card"]), ("pressed", THEME["card"])],
+                  foreground=[("active", THEME["accent"]), ("pressed", THEME["fg"])])
+        style.map("Active.Treeview",
+                  background=[("selected", THEME["selector_selected"])],
+                  foreground=[("selected", THEME["fg"])])
+
+        wrap = tk.Frame(card, bg=THEME["console_bg"], highlightbackground=THEME["card_edge"],
+                        highlightthickness=1)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=(2, 12))
+        self.tree_active = ttk.Treeview(wrap, columns=cols, show="headings", height=14,
+                                        style="Active.Treeview", selectmode="browse")
+        for c in cols:
+            self.tree_active.heading(c, text=self._active_headings[c],
+                                     command=lambda cc=c: self._sort_active_tree(cc))
+            self.tree_active.column(c, width=widths[c], anchor=anchors.get(c, "w"), stretch=True)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree_active.yview,
+                            style="Modern.Vertical.TScrollbar")
+        self.tree_active.configure(yscrollcommand=vsb.set)
+        self.tree_active.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.tree_active.bind("<Button-1>", self._on_active_row_click)
+
+        # State-tinted rows (whole-row background, no zebra: the tint IS the state).
+        self.tree_active.tag_configure("st_relaying", background="#12271B")
+        self.tree_active.tag_configure("st_handshake", background="#11263A")
+        self.tree_active.tag_configure("st_connecting", background="#2B2412")
+        self.tree_active.tag_configure("st_closing", background=THEME["console_bg"],
+                                       foreground=THEME["faint"])
+        self.tree_active.tag_configure("st_idle", background=THEME["console_bg"])
+
+        # Empty state overlay (hidden once rows arrive).
+        self.lbl_active_empty = tk.Label(
+            wrap, text="●  No active connections\n\n"
+                       "Start the engine — connections appear here in real time\n"
+                       "with endpoint, method, bytes and live state.",
+            bg=THEME["console_bg"], fg=THEME["faint"], font=FONT_N, justify=tk.CENTER)
+        self.lbl_active_empty.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Sorting state: (column, descending)
+        self._active_sort = ("time", True)
+        self._paint_active_headings()
+        # Rows currently displayed; keyed by conn id -> values tuple.
+        self._active_rows: dict[str, tuple] = {}
+        self._active_hidden = False  # "Clear display" only hides, not the conns
+
+    def _paint_active_headings(self):
+        """Heading text + sort arrow on the active sort column."""
+        try:
+            col, desc = self._active_sort
+            for c, base in self._active_headings.items():
+                arrow = "  ▾" if (c == col and desc) else ("  ▴" if c == col else "")
+                self.tree_active.heading(c, text=base + arrow)
+        except Exception:
+            pass
+
+    def _sort_active_tree(self, col):
+        try:
+            desc = (self._active_sort[0] == col) and not self._active_sort[1]
+            self._active_sort = (col, desc)
+            self._paint_active_headings()
+
+            def _num(v):
+                # "1.5 KB" -> 1536-ish ordering by first token is enough;
+                # fall back to 0 for junk.
+                try:
+                    return float(str(v).split()[0].replace(",", ""))
+                except (ValueError, IndexError):
+                    return 0.0
+
+            def _key(item):
+                v = self.tree_active.set(item).get(col, "")
+                if col in ("up", "down"):
+                    return _num(v)
+                return str(v)
+
+            items = sorted(self.tree_active.get_children(""), key=_key, reverse=desc)
+            for i, item in enumerate(items):
+                self.tree_active.move(item, "", i)
+        except Exception:
+            pass
+
+    def _on_active_row_click(self, event):
+        """Reveal the raw SNI for one session on click (deliberate debug exception)."""
+        try:
+            if self.tree_active.identify_region(event.x, event.y) != "cell":
+                return
+            item = self.tree_active.identify_row(event.y)
+            if not item:
+                return
+            raw = self._active_raw_snis.get(str(item), "")
+            if raw:
+                messagebox.showinfo("SNI (this session only)", raw)
+        except Exception:
+            pass
+
+    def _toggle_active_display(self):
+        """Clear display hides the live feed; click again to resume."""
+        if not self._active_hidden:
+            self._active_hidden = True
+            try:
+                for item in self.tree_active.get_children(""):
+                    self.tree_active.delete(item)
+            except Exception:
+                pass
+            try:
+                self.btn_clear_active.config(text="Show live")
+                self.lbl_active_chip.config(text="◌ display paused", fg=THEME["warning"])
+                self.lbl_active_empty.config(
+                    text="◌  Display paused\n\nPress “Show live” to resume the feed.")
+                self.lbl_active_empty.place(relx=0.5, rely=0.5, anchor="center")
+            except Exception:
+                pass
+        else:
+            self._active_hidden = False
+            try:
+                self.btn_clear_active.config(text="Clear display")
+                self.lbl_active_empty.config(
+                    text="●  No active connections\n\n"
+                         "Start the engine — connections appear here in real time\n"
+                         "with endpoint, method, bytes and live state.")
+            except Exception:
+                pass
+            self._update_active_table([])
+
+    def _update_active_table(self, active_list: list):
+        """Refresh the Treeview from the backend's active_list snapshot."""
+        try:
+            if self._active_hidden:
+                return
+            if not hasattr(self, "_active_raw_snis"):
+                self._active_raw_snis = {}
+            incoming = {}
+            raw_snis = {}
+            for e in (active_list or []):
+                try:
+                    cid = str(e.get("id", ""))
+                    if not cid:
+                        continue
+                    state = str(e.get("state", "") or "idle")
+                    glyph = self.ACTIVE_STATE_TAGS.get(state, ("st_idle", "·"))[1]
+                    incoming[cid] = (
+                        datetime.fromtimestamp(float(e.get("time", 0.0))).strftime("%H:%M:%S"),
+                        str(e.get("endpoint", "")),
+                        str(e.get("sni_hash", "") or ""),
+                        str(e.get("method", "")),
+                        fmt_bytes(e.get("up", 0)),
+                        fmt_bytes(e.get("down", 0)),
+                        "%s %s" % (glyph, state),
+                    )
+                    raw_snis[cid] = str(e.get("sni", "") or "")
+                except Exception:
+                    continue
+            self._active_raw_snis = raw_snis
+            cur_ids = set(incoming)
+            # Remove rows for connections that are gone.
+            for item in list(self.tree_active.get_children("")):
+                if str(item) not in cur_ids:
+                    self.tree_active.delete(item)
+            # Upsert visible rows (iid = connection id) + state tint tag.
+            for cid, vals in incoming.items():
+                state = vals[6].split(" ", 1)[1] if " " in vals[6] else "idle"
+                tag = self.ACTIVE_STATE_TAGS.get(state, ("st_idle",))[0]
+                if self.tree_active.exists(cid):
+                    self.tree_active.item(cid, values=vals, tags=(tag,))
+                else:
+                    try:
+                        self.tree_active.insert("", "end", iid=cid, values=vals, tags=(tag,))
+                    except Exception:
+                        pass
+            self._active_rows = incoming
+            # Count chip + empty-state overlay.
+            n = len(incoming)
+            if n > 0:
+                self.lbl_active_chip.config(text="● %d active" % n, fg=THEME["success"])
+                self.lbl_active_empty.place_forget()
+            else:
+                self.lbl_active_chip.config(text="● 0 active", fg=THEME["faint"])
+                self.lbl_active_empty.place(relx=0.5, rely=0.5, anchor="center")
+        except Exception:
+            pass
+
     # -- stats + console -------------------------------------------
     def _build_stats(self, right):
         bar = tk.Frame(right, bg=THEME["stats_bg"], highlightbackground=THEME["card_edge"],
@@ -2004,9 +2293,9 @@ class SpooferGUI:
         except ValueError:
             return None, "Endpoint port must be a number"
         endpoints = [{"ip": self.v_endpoint_ip.get().strip(), "port": default_port}]
-        endpoints += parse_host_list(self.e_extra.get(), default_port)
+        endpoints += parse_host_list(self.v_extra.get(), default_port)
         endpoints = [e for e in endpoints if e["ip"]]
-        snis = [self.v_fake_sni.get().strip()] + parse_sni_list(self.e_snis.get())
+        snis = [self.v_fake_sni.get().strip()] + parse_sni_list(self.v_snis.get())
         snis = [s for s in snis if s]
         try:
             cfg = {
@@ -2020,6 +2309,7 @@ class SpooferGUI:
                 "BYPASS_METHOD": self.v_method.get().strip(),
                 "HANDSHAKE_TIMEOUT": float(self.v_timeout.get().strip()),
                 "MAX_CONNECTIONS": int(self.v_maxconn.get().strip()),
+                "IDLE_TIMEOUT_S": float(self.v_idle.get().strip() or 300.0),
                 "FAKE_DELAY": 0.001,
                 "SOCKS5_PORT": int(self.v_socks.get().strip()),
                 "HTTP_PORT": int(self.v_http.get().strip()),
@@ -2059,28 +2349,95 @@ class SpooferGUI:
         return cfg
 
     def apply_cfg(self, cfg: dict):
-        cfg = cm.migrate(cfg)
-        self.v_listen_host.set(str(cfg.get("LISTEN_HOST", "0.0.0.0")))
-        self.v_listen_port.set(str(cfg.get("LISTEN_PORT", 40443)))
-        snis = cfg.get("FAKE_SNIS") or [cfg.get("FAKE_SNI", "")]
-        self.v_fake_sni.set(str(snis[0] if snis else ""))
-        self.e_snis.delete(0, tk.END)
-        self.e_snis.insert(0, ", ".join(snis[1:4]))
-        eps = cfg.get("ENDPOINTS") or []
-        self.v_endpoint_ip.set(str(eps[0]["ip"]) if eps else "")
-        self.v_endpoint_port.set(str(eps[0]["port"]) if eps else "443")
-        self.e_extra.delete(0, tk.END)
-        self.e_extra.insert(0, "; ".join("%s:%s" % (e["ip"], e["port"]) for e in eps[1:3]))
-        self.v_method.set(str(cfg.get("BYPASS_METHOD", "wrong_seq")))
-        self.v_timeout.set(str(cfg.get("HANDSHAKE_TIMEOUT", 2.0)))
-        self.v_maxconn.set(str(cfg.get("MAX_CONNECTIONS", 200)))
-        self.v_mode.set(str(cfg.get("MODE", "SNI Only")))
-        self.v_socks.set(str(cfg.get("SOCKS5_PORT", 10808)))
-        self.v_http.set(str(cfg.get("HTTP_PORT", 10809)))
-        self.v_password.set(str(cfg.get("TROJAN_PASSWORD", "humanity")))
-        self.v_transport.set(str(cfg.get("TRANSPORT", "ws")))
-        self.v_path.set(str(cfg.get("WS_PATH", "/assignment")))
-        self.v_host.set(str(cfg.get("WS_HOST", "www.creationlong.org")))
+        # Suppress autosave while mass-setting vars (profile load).
+        self._loading_config = True
+        try:
+            cfg = cm.migrate(cfg)
+            self.v_listen_host.set(str(cfg.get("LISTEN_HOST", "0.0.0.0")))
+            self.v_listen_port.set(str(cfg.get("LISTEN_PORT", 40443)))
+            snis = cfg.get("FAKE_SNIS") or [cfg.get("FAKE_SNI", "")]
+            self.v_fake_sni.set(str(snis[0] if snis else ""))
+            self.v_snis.set(", ".join(snis[1:4]))
+            eps = cfg.get("ENDPOINTS") or []
+            self.v_endpoint_ip.set(str(eps[0]["ip"]) if eps else "")
+            self.v_endpoint_port.set(str(eps[0]["port"]) if eps else "443")
+            self.v_extra.set("; ".join("%s:%s" % (e["ip"], e["port"]) for e in eps[1:3]))
+            self.v_method.set(str(cfg.get("BYPASS_METHOD", "wrong_seq")))
+            self.v_timeout.set(str(cfg.get("HANDSHAKE_TIMEOUT", 2.0)))
+            self.v_maxconn.set(str(cfg.get("MAX_CONNECTIONS", 200)))
+            self.v_idle.set(str(cfg.get("IDLE_TIMEOUT_S", 300.0)))
+            self.v_mode.set(str(cfg.get("MODE", "SNI Only")))
+            self.v_socks.set(str(cfg.get("SOCKS5_PORT", 10808)))
+            self.v_http.set(str(cfg.get("HTTP_PORT", 10809)))
+            self.v_password.set(str(cfg.get("TROJAN_PASSWORD", "humanity")))
+            self.v_transport.set(str(cfg.get("TRANSPORT", "ws")))
+            self.v_path.set(str(cfg.get("WS_PATH", "/assignment")))
+            self.v_host.set(str(cfg.get("WS_HOST", "www.creationlong.org")))
+        finally:
+            self._loading_config = False
+
+    # -- autosave (debounced) ---------------------------------------
+    AUTOSAVE_DEBOUNCE_MS = 800
+
+    def _schedule_autosave(self):
+        """Debounce-schedule a config save after any config var changes."""
+        try:
+            if self._loading_config or self.running:
+                return
+            if self._autosave_after_id is not None:
+                try:
+                    self.root.after_cancel(self._autosave_after_id)
+                except Exception:
+                    pass
+            self._autosave_after_id = self.root.after(
+                self.AUTOSAVE_DEBOUNCE_MS, self._do_autosave)
+        except Exception:
+            pass
+
+    def _do_autosave(self):
+        self._autosave_after_id = None
+        if self._loading_config or self.running:
+            return
+        try:
+            cfg, err = self._collect()
+            if err or cfg is None:
+                # Half-typed values (e.g. empty endpoint while editing) must
+                # not pop an error dialog — skip silently.
+                return
+            cm.save(CONFIG_PATH, cfg)
+            try:
+                self.log("autosaved config (debounced)", "info")
+            except Exception:
+                pass
+            # Brief "saved" blip in the status pill (subtle feedback).
+            try:
+                prev = self.status_lbl.cget("text")
+                if not self.running:
+                    self.status_lbl.config(text="saved")
+                    self.root.after(1000, lambda: self.status_lbl.config(text=prev))
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                self.log("autosave failed: %s" % exc, "warning")
+            except Exception:
+                pass
+
+    def _attach_autosave_vars(self):
+        """trace_add on every config StringVar + a pending-flush on close."""
+        vars_to_watch = [
+            self.v_listen_host, self.v_listen_port, self.v_endpoint_ip,
+            self.v_endpoint_port, self.v_fake_sni, self.v_method,
+            self.v_timeout, self.v_maxconn, self.v_idle,
+            self.v_mode, self.v_socks, self.v_http, self.v_password,
+            self.v_transport, self.v_path, self.v_host,
+            self.v_extra, self.v_snis,
+        ]
+        for v in vars_to_watch:
+            try:
+                v.trace_add("write", lambda *a: self._schedule_autosave())
+            except Exception:
+                pass
 
     def profile_refresh(self):
         try:
@@ -2216,6 +2573,66 @@ class SpooferGUI:
                             "Best SNI to spoof: %s (%sms). Press SAVE/START." % (best["sni"], best["latency_ms"])))
         self._run_bg(job)
 
+    def smart_rank_endpoints(self):
+        """TCP-connect ping every configured endpoint, ranked by latency."""
+        eps = self._all_endpoints()
+        if not eps:
+            self.log("No endpoints configured — set Endpoint IP or ip_list.txt.", "warning")
+            return
+        try:
+            timeout = float(self.v_timeout.get().strip() or 3.0)
+        except ValueError:
+            timeout = 3.0
+        timeout = min(max(timeout, 0.5), 10.0)
+        tries = 2
+        self.log("Pinging %d endpoint(s) (TCP connect, %.1fs timeout, %d tries)..."
+                 % (len(eps), timeout, tries), "info")
+
+        def job():
+            ranked = smart.rank_endpoints(eps, timeout=timeout, tries=tries)
+            for r in ranked:
+                if r["ok"]:
+                    self.msg_q.put(("log", "smart",
+                                    "endpoint %s:%s -> %sms OK" % (r["ip"], r["port"], r["latency_ms"])))
+                else:
+                    self.msg_q.put(("log", "smart",
+                                    "endpoint %s:%s -> FAIL" % (r["ip"], r["port"])))
+            ok = [r for r in ranked if r["ok"]]
+            if ok:
+                self.msg_q.put(("log", "smart",
+                                "Best endpoint: %s:%s (%sms, %d/%d OK)"
+                                % (ok[0]["ip"], ok[0]["port"], ok[0]["latency_ms"], len(ok), len(ranked))))
+            else:
+                self.msg_q.put(("log", "smart", "No endpoint answered."))
+        self._run_bg(job)
+
+    def smart_use_best_endpoint(self):
+        """Ping endpoints and apply the fastest one as the primary endpoint."""
+        eps = self._all_endpoints()
+        if not eps:
+            self.log("No endpoints configured — set Endpoint IP or ip_list.txt.", "warning")
+            return
+        try:
+            timeout = float(self.v_timeout.get().strip() or 3.0)
+        except ValueError:
+            timeout = 3.0
+        timeout = min(max(timeout, 0.5), 10.0)
+        tries = 2
+        self.log("Pinging %d endpoint(s), will use the fastest..." % len(eps), "info")
+
+        def job():
+            ranked = smart.rank_endpoints(eps, timeout=timeout, tries=tries)
+            ok = [r for r in ranked if r["ok"]]
+            if not ok:
+                self.msg_q.put(("log", "smart", "No endpoint answered — keeping current endpoint."))
+                return
+            best = ok[0]
+            self.msg_q.put(("use_best_endpoint", best))
+            self.msg_q.put(("log", "smart",
+                            "Primary endpoint set to %s:%s (%sms). Press SAVE/START."
+                            % (best["ip"], best["port"], best["latency_ms"])))
+        self._run_bg(job)
+
     def smart_reload_lists(self):
         try:
             port = int(self.v_endpoint_port.get().strip() or 443)
@@ -2232,15 +2649,13 @@ class SpooferGUI:
         self.log("Reloaded: %d endpoint(s) from ip_list.txt, "
                  "%d SNI(s) from sni_list.txt." % (len(self.file_endpoints), len(self.file_snis)), "success")
         try:
-            if self.file_endpoints and not self.e_extra.get().strip():
-                self.e_extra.delete(0, tk.END)
-                self.e_extra.insert(0, "; ".join(
+            if self.file_endpoints and not self.v_extra.get().strip():
+                self.v_extra.set("; ".join(
                     "%s:%s" % (e["ip"], e["port"]) for e in self.file_endpoints[:4]))
-            if self.file_snis and not self.e_snis.get().strip():
+            if self.file_snis and not self.v_snis.get().strip():
                 primary = self.v_fake_sni.get().strip()
                 rest = [s for s in self.file_snis if s != primary][:4]
-                self.e_snis.delete(0, tk.END)
-                self.e_snis.insert(0, ", ".join(rest))
+                self.v_snis.set(", ".join(rest))
         except Exception:
             pass
         self.toast("Lists reloaded", "success")
@@ -2333,6 +2748,8 @@ class SpooferGUI:
         self.best_method = ""
         self.method_rate = 0.0
         self.method_runs = 0
+        self.auto_method = ""
+        self.auto_stats = {}
         # Traffic tracker reset for this run.
         self.up_bytes = 0
         self.down_bytes = 0
@@ -2535,6 +2952,17 @@ class SpooferGUI:
                         self.up_bytes, self.down_bytes = new_up, new_down
                     except Exception:
                         pass
+                    try:
+                        am = obj.get("auto_method") or {}
+                        if isinstance(am, dict) and am.get("method"):
+                            self.auto_method = str(am.get("method", ""))
+                            self.auto_stats = am
+                    except Exception:
+                        pass
+                    try:
+                        self._update_active_table(obj.get("active_list") or [])
+                    except Exception:
+                        pass
                     self._refresh_stats()
                     self._update_method_hint()
                 elif kind == "busy":
@@ -2542,6 +2970,22 @@ class SpooferGUI:
                         self.busy_jobs = max(0, self.busy_jobs + int(msg[1]))
                     except Exception:
                         pass
+                elif kind == "use_best_endpoint":
+                    try:
+                        _, best = msg
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(best, dict):
+                        continue
+                    ip = str(best.get("ip", "") or "").strip()
+                    port = str(best.get("port", "") or "").strip()
+                    if ip:
+                        self.v_endpoint_ip.set(ip)
+                        if port:
+                            self.v_endpoint_port.set(port)
+                    self._append("Primary endpoint set to %s:%s "
+                                 "(%sms)" % (ip, port, best.get("latency_ms")), "success")
+                    self.toast("Best endpoint applied: %s:%s" % (ip, port), "success")
                 elif kind == "use_best_sni":
                     try:
                         _, best = msg
@@ -2634,7 +3078,12 @@ class SpooferGUI:
             self.lbl_okfail.config(text="OK %d · Fail %d" % (self.success_conns, self.failed_conns))
             best = self.best_endpoint or "—"
             self.lbl_best.config(text="Best %s (%.0f%%)" % (best, self.success_rate * 100.0))
-            if self.best_method:
+            if self.auto_method:
+                st = self.auto_stats or {}
+                self.lbl_method.config(text="Method auto→%s (%d att, %d fail, %.0fs)"
+                                       % (self.auto_method, int(st.get("attempts", 0)),
+                                          int(st.get("failures", 0)), float(st.get("elapsed", 0.0))))
+            elif self.best_method:
                 runs = self.method_runs
                 self.lbl_method.config(text="Method %s · %.0f%% (%d)" % (self.best_method, self.method_rate * 100.0, runs))
             else:
@@ -2865,6 +3314,17 @@ class SpooferGUI:
         self.toast("Proxy info copied", "success")
 
     def on_closing(self):
+        # Flush any pending debounced autosave so the last edits survive.
+        try:
+            if self._autosave_after_id is not None:
+                try:
+                    self.root.after_cancel(self._autosave_after_id)
+                except Exception:
+                    pass
+                self._autosave_after_id = None
+                self._do_autosave()
+        except Exception:
+            pass
         # NOTE: no try/finally with destroy inside — a `return` (user said No)
         # must leave the window alive. _shutdown_children never raises.
         if self.running:
@@ -2911,7 +3371,9 @@ class SpooferGUI:
 
 def main():
     os.chdir(APP_DIR)
+    set_windows_appusermodelid()  # before the first window exists
     root = tk.Tk()
+    set_app_icon(root)
     SpooferGUI(root)
     root.mainloop()
 

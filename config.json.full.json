@@ -24,10 +24,11 @@
     "builder.io",
     "strapi.io"
   ],
-  "BYPASS_METHOD": "padding",
+  "BYPASS_METHOD": "wrong_seq",
   "HANDSHAKE_TIMEOUT": 2.0,
   "MAX_CONNECTIONS": 200,
   "FAKE_DELAY": 0.001,
+  "IDLE_TIMEOUT_S": 300.0,
   "SOCKS5_PORT": 10808,
   "HTTP_PORT": 10809,
   "MODE": "Trojan + Xray",

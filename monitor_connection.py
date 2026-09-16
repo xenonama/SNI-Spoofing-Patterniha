@@ -4,6 +4,9 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import uuid
+
+from utils.auto_state import get_auto_state
 
 
 class MonitorConnection:
@@ -40,6 +43,92 @@ _sni_board: dict[str, dict[str, int]] = {}
 # long uptime (rotation, failover). Prune oldest when over the cap — core
 # stats (counters, traffic) are unaffected.
 _BOARD_CAP = 200
+
+# Live connection view for the GUI "Active Connections" page.
+# Keyed by a UUID string (NOT the injector tuple id, which changes on
+# failover re-keying). Capped FIFO to bound memory on long uptime.
+_active_list: dict[str, dict] = {}
+_ACTIVE_CAP = 500
+
+
+def register_active(conn_id: str, endpoint: str, sni: str, method: str,
+                    state: str = "connecting") -> str:
+    """Add a live connection entry; returns the key used (UUID string).
+
+    Thread-safe, never raises. Empty conn_id -> a fresh UUID is generated.
+    """
+    try:
+        key = str(conn_id or "").strip() or uuid.uuid4().hex
+        with _stats_lock:
+            _active_list[key] = {
+                "id": key,
+                "time": time.time(),
+                "endpoint": str(endpoint or ""),
+                # Raw SNI kept for the GUI's deliberate click-to-reveal debug
+                # exception; consumers MUST display sni_hash instead.
+                "sni": str(sni or ""),
+                "sni_hash": _hash_label(sni),
+                "method": str(method or ""),
+                "state": str(state or "connecting"),
+                "up": 0,
+                "down": 0,
+            }
+            while len(_active_list) > _ACTIVE_CAP:
+                _active_list.pop(next(iter(_active_list)), None)
+        return key
+    except Exception:
+        return str(conn_id or "")
+
+
+def update_active(conn_id: str, up: int = 0, down: int = 0, state: str = "",
+                  **fields) -> None:
+    """Merge byte DELTAS / state / extra fields into a live entry. Never raises."""
+    try:
+        with _stats_lock:
+            entry = _active_list.get(str(conn_id or ""))
+            if entry is None:
+                return
+            entry["up"] += max(0, int(up))
+            entry["down"] += max(0, int(down))
+            if state:
+                entry["state"] = str(state)
+            for k, v in fields.items():
+                if v:
+                    entry[k] = v
+    except Exception:
+        pass
+
+
+def unregister_active(conn_id: str) -> None:
+    try:
+        with _stats_lock:
+            _active_list.pop(str(conn_id or ""), None)
+    except Exception:
+        pass
+
+
+def get_active_list() -> list:
+    """Copy of live entries, oldest first. Safe, no lock held on return."""
+    try:
+        with _stats_lock:
+            return sorted(
+                (dict(v) for v in _active_list.values()),
+                key=lambda e: e.get("time", 0.0),
+            )
+    except Exception:
+        return []
+
+
+def _hash_label(sni: str) -> str:
+    """Short one-way label for table display (privacy: no raw domains)."""
+    try:
+        import hashlib
+        s = str(sni or "").strip().lower()
+        if not s:
+            return ""
+        return "sni#" + hashlib.sha256(s.encode("utf-8", "ignore")).hexdigest()[:8]
+    except Exception:
+        return ""
 
 
 def _prune_board(board: dict) -> None:
@@ -97,6 +186,12 @@ def get_traffic() -> tuple:
         return _up_bytes, _down_bytes
 
 
+def get_traffic_snapshot() -> tuple:
+    """Atomic (up_bytes, down_bytes) tuple for per-connection delta capture."""
+    with _stats_lock:
+        return _up_bytes, _down_bytes
+
+
 def finish_success():
     """Handshake bypass succeeded: no longer monitored, no longer 'active'."""
     decrement_active()
@@ -129,9 +224,24 @@ def get_failed():
         return _failed_connections
 
 
-def record_result(endpoint: str = "", sni: str = "", ok: bool = True, method: str = ""):
-    """Learn per-endpoint / per-SNI / per-method bypass success. Thread-safe, never raises."""
+def record_result(endpoint: str = "", sni: str = "", ok: bool = True, method: str = "",
+                  auto_resolved: bool = False):
+    """Learn per-endpoint / per-SNI / per-method bypass success. Thread-safe, never raises.
+
+    When auto_resolved is True (the connection's method came from the sticky
+    "auto" rotation), the outcome is ALSO fed to AutoState so the rotation
+    window learns: success -> note_success (never a failure), fail -> note_failure.
+    """
     try:
+        if auto_resolved:
+            try:
+                st = get_auto_state()
+                if ok:
+                    st.note_success()
+                else:
+                    st.note_failure()
+            except Exception:
+                pass
         with _stats_lock:
             if endpoint:
                 cell = _endpoint_board.setdefault(endpoint, {"ok": 0, "fail": 0})
@@ -190,7 +300,7 @@ def get_snapshot() -> dict:
         tot = _success_connections + _failed_connections
         eps = _ranked(_endpoint_board, 5)
         methods = _ranked(_method_board, 3)
-        return {
+        snap = {
             "type": "stats",
             "active": _active_connections,
             "total": _total_connections,
@@ -207,6 +317,18 @@ def get_snapshot() -> dict:
                 "endpoints": eps,
             },
         }
+    # Outside the stats lock: auto state owns its own lock — never nest the
+    # two in the opposite order anywhere else.
+    try:
+        snap["auto_method"] = get_auto_state().stats()
+    except Exception:
+        snap["auto_method"] = {"method": "", "attempts": 0, "failures": 0,
+                               "successes": 0, "elapsed": 0.0}
+    try:
+        snap["active_list"] = get_active_list()
+    except Exception:
+        snap["active_list"] = []
+    return snap
 
 
 def reset_stats():
@@ -223,3 +345,4 @@ def reset_stats():
         _endpoint_board.clear()
         _sni_board.clear()
         _method_board.clear()
+        _active_list.clear()

@@ -34,10 +34,16 @@ REAL_METHODS = ("wrong_seq", "wrong_seq_ttl", "split_seq", "fragmented", "paddin
 
 
 def resolve_method(name: str) -> str:
-    """Map a configured method to the wire method for one connection."""
+    """Map a configured method to the wire method for one connection.
+
+    "auto" is sticky: AutoState.next_method() returns the SAME method for a
+    window (rotating on failures/attempts/time) instead of re-randomizing
+    every connection. Real methods bypass auto entirely.
+    """
     name = str(name or "").strip() or "auto"
     if name == "auto":
-        return random.choice(REAL_METHODS)
+        from utils.auto_state import get_auto_state
+        return get_auto_state().next_method()
     if name in REAL_METHODS:
         return name
     raise ValueError("unsupported bypass method: %r (expected one of %s)" % (name, SUPPORTED_METHODS))

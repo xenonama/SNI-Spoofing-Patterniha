@@ -18,6 +18,7 @@ DEFAULTS: dict = {
     "HANDSHAKE_TIMEOUT": 2.0,
     "MAX_CONNECTIONS": 200,
     "FAKE_DELAY": 0.001,
+    "IDLE_TIMEOUT_S": 300.0,
     # GUI-only:
     "SOCKS5_PORT": 10808,
     "HTTP_PORT": 10809,
@@ -30,7 +31,8 @@ DEFAULTS: dict = {
 
 INJECTOR_KEYS = ("LISTEN_HOST", "LISTEN_PORT", "CONNECT_IP", "CONNECT_PORT",
                  "ENDPOINTS", "FAKE_SNI", "FAKE_SNIS", "BYPASS_METHOD",
-                 "HANDSHAKE_TIMEOUT", "MAX_CONNECTIONS", "FAKE_DELAY")
+                 "HANDSHAKE_TIMEOUT", "MAX_CONNECTIONS", "FAKE_DELAY",
+                 "IDLE_TIMEOUT_S")
 
 SUPPORTED_METHODS = ("auto", "wrong_seq", "wrong_seq_ttl", "split_seq", "fragmented", "padding", "delayed_retry", "double_sni")
 
@@ -79,6 +81,7 @@ def migrate(cfg: dict) -> dict:
     out["HANDSHAKE_TIMEOUT"] = _as_float(out.get("HANDSHAKE_TIMEOUT", 2.0), 2.0)
     out["MAX_CONNECTIONS"] = _as_int(out.get("MAX_CONNECTIONS", 200), 200)
     out["FAKE_DELAY"] = _as_float(out.get("FAKE_DELAY", 0.001), 0.001)
+    out["IDLE_TIMEOUT_S"] = _as_float(out.get("IDLE_TIMEOUT_S", 300.0), 300.0)
     return out
 
 
@@ -134,6 +137,12 @@ def validate(cfg: dict) -> list[str]:
             errs.append("MAX_CONNECTIONS should be 10..2000")
     except (TypeError, ValueError):
         errs.append("MAX_CONNECTIONS must be a number")
+    try:
+        it = float(cfg.get("IDLE_TIMEOUT_S", 300.0))
+        if not 0 < it <= 3600:
+            errs.append("IDLE_TIMEOUT_S should be 0 < s <= 3600")
+    except (TypeError, ValueError):
+        errs.append("IDLE_TIMEOUT_S must be a number")
     return errs
 
 
@@ -180,6 +189,7 @@ def injector_dict(cfg: dict) -> dict:
         "HANDSHAKE_TIMEOUT": float(cfg["HANDSHAKE_TIMEOUT"]),
         "MAX_CONNECTIONS": int(cfg["MAX_CONNECTIONS"]),
         "FAKE_DELAY": float(cfg["FAKE_DELAY"]),
+        "IDLE_TIMEOUT_S": float(cfg["IDLE_TIMEOUT_S"]),
     }
 
 
